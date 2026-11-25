@@ -115,7 +115,6 @@ function _getcid() {
 function _freecid() {
         local service=$1 cid=$2 ret
         if ! timeout $tout qmicli -d $devname --${service}-noop --client-cid=$cid; then
-                printf "[qmictrl][ERROR] failed to free %s cid:%s\n" $service $cid
                 return 1
         fi
         return 0 
@@ -130,54 +129,63 @@ function _setmode() {
         printf "[qmictrl][INFO ] success to set mode %s\n" $mode
         return 0
 } 
+function _setrawmode() {
+        local ret
+        ret=$(ip link set $iface down) || return 1
+        ret=$(echo 'Y' | tee /sys/class/net/$iface/qmi/raw_ip) || return 1
+        ret=$(ip link set $iface up) || return 1
+        return 0
+}
 function _getnetwork() {
-        local ret iface
+        local ret
         ret=$(timeout $tout qmicli -d $devname --nas-get-home-network --client-no-release-cid --client-cid=$nas)
         if ! grep -qi "Successfully" <<< "$ret"; then
                 return 1
         fi
-        iface=$(qmicli -d $devname -w) || return 1
-        ret=$(ip link set $iface down) || return 1
-        ret=$(echo 'Y' | tee /sys/class/net/$iface/qmi/raw_ip) || return 1
-        ret=$(ip link set $iface up) || return 1
+        iface=$(timeout $tout qmicli -d $devname -w) || return 1
         printf "%s\n" $iface
+        _setrawmode
         return 0
 }
 function _getaddr() {
         local ret gw
-        if [[ -z $pdhandle ]]; then
-                if ! ret=$(timeout $tout qmicli -p -d $devname           \
-                        --device-open-net='net-raw-ip|net-no-qos-header' \
-                        --wds-start-network="apn=$apn,ip-type=4"         \
-                        --client-no-release-cid --client-cid=$wds 2>&1); 
-                then
-                        printf "[qmictrl][ERROR] failed to start network:\n%s\n" "$ret"
-                        return 1
-                fi
-                pdhandle=$(awk -F"'" '/Packet data handle/ {print $2}' <<< "$ret")
-                if [[ -z "$pdhandle" ]]; then
-                        printf "[qmictrl][ERROR] failed to obtain packet data handle\n"
-                        return 1
-                fi
+        if [[ -n $(printf "%s" $pdhandle) ]]; then
+                _stopnetwork
         fi
-        if ! ret=$(timeout $tout udhcpc -i $iface -n -q 2>&1); then
-                printf "[qmictrl][INFO ] DHCP acquisition failed:\n%s\n" $ret
+        if ! ret=$(timeout $tout qmicli -p -d $devname           \
+                --device-open-net='net-raw-ip|net-no-qos-header' \
+                --wds-start-network="apn=$apn,ip-type=4"         \
+                --client-no-release-cid --client-cid=$wds 2>&1); 
+        then
+                printf "[qmictrl][ERROR] failed to start network:\n%s\n" "$ret"
+                return 1
+        fi
+        pdhandle=$(awk -F"'" '/Packet data handle/ {print $2}' <<< "$ret")
+        if [[ -z "$pdhandle" ]]; then
+                printf "[qmictrl][ERROR] failed to obtain packet data handle\n"
+                return 1
+        fi
+        # -T Pause between packets, -t Send up to N discover packets
+        if ! ret=$(timeout $tout udhcpc -i $iface -n -q -t 3 -T 2 2>&1); then
+                printf "[qmictrl][INFO ] dhcp acquisition failed:\n%s\n" "$ret"
+                _setrawmode
                 return 1
         fi
         if ! grep -qi "lease" <<< "$ret" ; then
-                printf "[qmictrl][INFO ] DHCP acquisition failed:\n%s\n" $ret
+                printf "[qmictrl][INFO ] dhcp acquisition failed:\n%s\n" "$ret"
+                _setrawmode
                 return 1
         fi
         if ! ip -4 addr show dev $iface | grep -q 'inet '; then
-                printf "[qmictrl][INFO ] DHCP did not configure an IPv4 address\n"
+                printf "[qmictrl][INFO ] dhcp did not configure an IPv4 address\n"
                 return 1
         fi
         sleep 3
         ret=$(ip link set $iface up)
-        # ret=$(ip route del default dev $iface)
+        ip route del default dev $iface 2>/dev/null
         gw=$(ip route show dev $iface | awk -F '/' '{print $1}')
-        ret=$(ip route add default via $gw dev $iface metric 200)
-        printf "[qmictrl][INFO ] online\n" 
+        ret=$(ip route add default via $gw dev $iface metric 200 2>&1) || printf "[qmictrl][WARN ] route add failed: %s\n" "$ret"
+        printf "[qmictrl][INFO ] online %s\n" "$gw" 
         return 0
 }
 function _stopnetwork() {
@@ -187,6 +195,7 @@ function _stopnetwork() {
         fi
         if ! ret=$(timeout $tout qmicli -d $devname --wds-stop-network=$pdhandle --client-no-release-cid --client-cid=$wds); then
                 printf "[qmictrl][WARN ] failed to stop WDS session:\n%s\n" "$ret"
+                pdhandle=""
                 return 1
         fi
         pdhandle=""
@@ -242,9 +251,18 @@ function _cleanup() {
         local status=${1:-0}
         printf "[qmictrl][INFO ] releasing cids ...\n"
         _stopnetwork
-        _freecid wds $wds || status=1
-        _freecid dms $dms || status=1
-        _freecid nas $nas || status=1
+        if [[ -n $(printf "%s" $wds) ]]; then 
+                _freecid wds $wds || status=1
+                wds=""
+        fi
+        if [[ -n $(printf "%s" $dms) ]]; then 
+                _freecid dms $dms || status=1
+                dms=""
+        fi
+        if [[ -n $(printf "%s" $nas) ]]; then 
+                _freecid nas $nas || status=1
+                nas=""
+        fi
         exit $status
 }
 
@@ -291,7 +309,7 @@ read -r -a devs <<< "$lan"
 
 trap _cleanup INT TERM # signal handler
 
-telpath=/tmp/qmi/${devname}/stats
+telpath=/tmp/qmi/${devname##*/}/stats
 printf "[qmictrl] create directory for telemetry: %s\n" $telpath
 mkdir -p "$telpath"
 
@@ -308,29 +326,40 @@ while true; do
         state=$next_state
         case $state in
                 STATUS)
-                        printf "[qmictrl] device path:   \t%s\n" $devname
-                        printf "[qmictrl] interface name:\t%s\n" $iface
-                        printf "[qmictrl] probe address: \t%s\n" $probe
-                        printf "[qmictrl] probe interval:\t%s\n" $interval
-                        printf "[qmictrl] be router:     \t%s\n" $router
-                        printf "[qmictrl] lan:           \t%s\n" $lan
+                        printf "[qmictrl] device path:   \t%s\n" "$devname"
+                        printf "[qmictrl] interface name:\t%s\n" "$iface"
+                        printf "[qmictrl] probe address: \t%s\n" "$probe"
+                        printf "[qmictrl] probe interval:\t%s\n" "$interval"
+                        printf "[qmictrl] be router:     \t%s\n" "$router"
+                        printf "[qmictrl] lan:           \t%s\n" "$lan"
 
-                        _freecid wds $wds
-                        _freecid dms $dms
-                        _freecid nas $nas
-                        wds=$(_getcid wds) || exit 1 
-                        dms=$(_getcid dms) || exit 1 
-                        nas=$(_getcid nas) || exit 1 
-
-                        printf "[qmictrl] wds cid:       \t%s\n" $wds
-                        printf "[qmictrl] dms cid:       \t%s\n" $dms
-                        printf "[qmictrl] nas cid:       \t%s\n" $nas
-
-                        if ! _setmode online; then
+                        _stopnetwork
+                        if [[ -n $(printf "%s" $wds) ]]; then 
+                                _freecid wds $wds 
+                                wds=""
+                        fi
+                        if [[ -n $(printf "%s" $dms) ]]; then 
+                                _freecid dms $dms 
+                                dms=""
+                        fi
+                        if [[ -n $(printf "%s" $nas) ]]; then 
+                                _freecid nas $nas 
+                                nas=""
+                        fi
+                        wds=$(_getcid wds); dms=$(_getcid dms); nas=$(_getcid nas)
+                        if [[ -z $wds || -z $dms || -z $nas ]]; then
                                 next_state=STATUS
                                 sleep $retryinterval
                         else
-                                next_state=AVAILABLE
+                                printf "[qmictrl] wds cid:       \t%s\n" $wds
+                                printf "[qmictrl] dms cid:       \t%s\n" $dms
+                                printf "[qmictrl] nas cid:       \t%s\n" $nas
+                                if ! _setmode online; then
+                                        next_state=STATUS
+                                        sleep $retryinterval
+                                else
+                                        next_state=AVAILABLE
+                                fi
                         fi
                 ;;
                 AVAILABLE)
@@ -385,33 +414,28 @@ while true; do
                                 rtt=-1
                         fi
                         printf "[qmictrl][DEBUG] packet loss: %s%%, RTT: %s ms\n" "$loss" "$rtt"
-
                         ret=$(timeout $tout qmicli -d $devname --wds-get-packet-statistics --client-no-release-cid --client-cid=$wds)
-                        #printf "[qmictrl][DEBUG] %s\n" "$ret"
-
-                        if [ -n "$ret" ]; then
+                        if grep -qi "packets" <<< "$ret"; then
                                 tx_packets=$(awk -F: '/TX packets OK:/ {gsub(/[^0-9]/,"",$2); print $2}' <<< "$ret")
                                 rx_packets=$(awk -F: '/RX packets OK:/ {gsub(/[^0-9]/,"",$2); print $2}' <<< "$ret")
                                 tx_dropped=$(awk -F: '/TX packets dropped:/ {gsub(/[^0-9]/,"",$2); print $2}' <<< "$ret")
                                 rx_dropped=$(awk -F: '/RX packets dropped:/ {gsub(/[^0-9]/,"",$2); print $2}' <<< "$ret")
                                 tx_bytes=$(awk -F: '/TX bytes OK:/ {gsub(/[^0-9]/,"",$2); print $2}' <<< "$ret")
                                 rx_bytes=$(awk -F: '/RX bytes OK:/ {gsub(/[^0-9]/,"",$2); print $2}' <<< "$ret")
-
-                                [ -n "$tx_packets" ] && printf "%s\n" "$tx_packets" > "$telpath/tx_packets"
-                                [ -n "$rx_packets" ] && printf "%s\n" "$rx_packets" > "$telpath/rx_packets"
-                                [ -n "$tx_dropped" ] && printf "%s\n" "$tx_dropped" > "$telpath/tx_dropped"
-                                [ -n "$rx_dropped" ] && printf "%s\n" "$rx_dropped" > "$telpath/rx_dropped"
-                                [ -n "$tx_bytes" ]   && printf "%s\n" "$tx_bytes"   > "$telpath/tx_bytes"
-                                [ -n "$rx_bytes" ]   && printf "%s\n" "$rx_bytes"   > "$telpath/rx_bytes"
+                                printf "%s\n" "$tx_packets" > "$telpath/tx_packets"
+                                printf "%s\n" "$rx_packets" > "$telpath/rx_packets"
+                                printf "%s\n" "$tx_dropped" > "$telpath/tx_dropped"
+                                printf "%s\n" "$rx_dropped" > "$telpath/rx_dropped"
+                                printf "%s\n" "$tx_bytes"   > "$telpath/tx_bytes"
+                                printf "%s\n" "$rx_bytes"   > "$telpath/rx_bytes"
                         fi
-                        
                         if [ $loss -gt 80 ] && [ $loss -le 95 ]; then
-                                printf "[qmictrl][INFO] Connection instable %s packet loss, %s ms ...\n" $loss, $rtt
+                                printf "[qmictrl][INFO] Connection instable %s packet loss, %s ms ...\n" $loss $rtt
                                 tries=0
                                 next_state=PROBE
                         elif [ $loss -gt 95 ]; then
                                 if [ "$tries" -lt "$maxtries" ]; then
-                                        printf "[qmictrl][INFO] Connection instable %s packet loss, %s ms ...\n" $loss, $rtt
+                                        printf "[qmictrl][INFO] Connection instable %s packet loss, %s ms ...\n" $loss $rtt
                                         next_state=PROBE
                                         sleep $retryinterval
                                 else
