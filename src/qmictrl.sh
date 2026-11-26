@@ -79,13 +79,35 @@ function _version() {
 
 # Optional reset
 function _reset() {
-        if [[ -n $(which gpioset) ]]; then
-                printf "[qmictrl][WARN ] reseting device through gpiod ...\n"
-                for _ in {0..1}; do
-                        gpioset -c gpiochip0 -t 0 6=1; sleep 0.5
-                        gpioset -c gpiochip0 -t 0 6=0; sleep 0.5
-                done
+        local i
+        if [[ -z "$gpio" || -z $(which gpioset) ]]; then
+                return 1
         fi
+        printf "[qmictrl][WARN ] reseting device through gpio %s ...\n" $gpio
+        # HIGH 3-5s then LOW to power off
+        gpioset -c gpiochip0 -t 0 $gpio=1; sleep 4
+        gpioset -c gpiochip0 -t 0 $gpio=0
+        # Wait for the module to shut down completely
+        for (( i = 0; i < 30; i++ )); do
+                if [ ! -e "$devname" ]; then
+                        break
+                fi
+                sleep 1
+        done
+        if [ -e "$devname" ]; then
+                printf "[qmictrl][WARN ] device did not shut down\n"
+        fi
+        # HIGH 1s then LOW to power on
+        gpioset -c gpiochip0 -t 0 $gpio=1; sleep 1
+        gpioset -c gpiochip0 -t 0 $gpio=0
+        # Wait for the module to boot
+        for (( i = 0; i < 60; i++ )); do
+                if [ -e "$devname" ]; then
+                        break
+                fi
+                sleep 1
+        done
+        return 0
 }
 function _checkdepend() {
         for cmd in qmicli ip udhcpc iptables ping timeout sysctl; do
@@ -99,14 +121,15 @@ function _checkdepend() {
 function _getcid() {
         local service=$1 ret cid
         sleep 0.2
-        ret=$(timeout $tout qmicli -d $devname --${service}-noop --client-no-release-cid)
+        ret=$(timeout $tout qmicli -p -d $devname --${service}-noop --client-no-release-cid)
         if [[ -z $(printf "%s" $ret) ]]; then
-                printf "[qmictrl][ERROR] failed to get cid %s\n" $service
+                # To stderr, stdout is captured as the cid
+                printf "[qmictrl][ERROR] failed to get cid %s\n" $service >&2
                 return 1
         fi
         cid=$(printf "%s" $ret | grep -i CID | awk -F"'" '/CID/ {print $4}')
         if [[ -z $(printf "%s" $cid) ]]; then
-                printf "[qmictrl][ERROR] failed to get cid %s\n" $service
+                printf "[qmictrl][ERROR] failed to get cid %s\n" $service >&2
                 return 1
         fi
         printf "%s\n" $cid
@@ -114,14 +137,14 @@ function _getcid() {
 }
 function _freecid() {
         local service=$1 cid=$2 ret
-        if ! timeout $tout qmicli -d $devname --${service}-noop --client-cid=$cid; then
+        if ! timeout $tout qmicli -p -d $devname --${service}-noop --client-cid=$cid; then
                 return 1
         fi
         return 0 
 }
 function _setmode() {
         local mode=$1 ret
-        ret=$(timeout $tout qmicli -d $devname --dms-set-operating-mode=$mode --client-no-release-cid --client-cid=$dms)
+        ret=$(timeout $tout qmicli -p -d $devname --dms-set-operating-mode=$mode --client-no-release-cid --client-cid=$dms)
         if ! grep -qi "success" <<< "$ret"; then
                 printf "[qmictrl][INFO ] failed to set mode %s\n" $mode
                 return 1
@@ -138,17 +161,27 @@ function _setrawmode() {
 }
 function _getnetwork() {
         local ret
-        ret=$(timeout $tout qmicli -d $devname --nas-get-home-network --client-no-release-cid --client-cid=$nas)
+        ret=$(timeout $tout qmicli -p -d $devname --nas-get-home-network --client-no-release-cid --client-cid=$nas)
         if ! grep -qi "Successfully" <<< "$ret"; then
                 return 1
         fi
-        iface=$(timeout $tout qmicli -d $devname -w) || return 1
+        iface=$(timeout $tout qmicli -p -d $devname -w) || return 1
         printf "%s\n" $iface
         _setrawmode
         return 0
 }
+# Serving cell signal, RSSI/RSRP in dBm, RSRQ/SNR in dB, min is the usable limit
+function _getsignal() {
+        local ret rssi rsrp rsrq snr
+        ret=$(timeout $tout qmicli -p -d $devname --nas-get-signal-info --client-no-release-cid --client-cid=$nas 2>&1)
+        rssi=$(awk -F"'" '/RSSI:/ {split($2, v, " "); print v[1]; exit}' <<< "$ret")
+        rsrp=$(awk -F"'" '/RSRP:/ {split($2, v, " "); print v[1]; exit}' <<< "$ret")
+        rsrq=$(awk -F"'" '/RSRQ:/ {split($2, v, " "); print v[1]; exit}' <<< "$ret")
+        snr=$(awk -F"'" '/SNR:/ {split($2, v, " "); print v[1]; exit}' <<< "$ret")
+        printf "[qmictrl][DEBUG] RSSI: %s dBm (min -85), RSRP: %s dBm (min -100), RSRQ: %s dB (min -20), SNR: %s dB (min 0)\n" "${rssi:--}" "${rsrp:--}" "${rsrq:--}" "${snr:--}"
+}
 function _getaddr() {
-        local ret gw
+        local ret
         if [[ -n $(printf "%s" $pdhandle) ]]; then
                 _stopnetwork
         fi
@@ -183,9 +216,8 @@ function _getaddr() {
         sleep 3
         ret=$(ip link set $iface up)
         ip route del default dev $iface 2>/dev/null
-        gw=$(ip route show dev $iface | awk -F '/' '{print $1}')
-        ret=$(ip route add default via $gw dev $iface metric 200 2>&1) || printf "[qmictrl][WARN ] route add failed: %s\n" "$ret"
-        printf "[qmictrl][INFO ] online %s\n" "$gw" 
+        ret=$(ip route add default dev $iface metric 200 2>&1) || printf "[qmictrl][WARN ] route add failed: %s\n" "$ret"
+        printf "[qmictrl][INFO ] online %s\n" "$iface"
         return 0
 }
 function _stopnetwork() {
@@ -193,7 +225,7 @@ function _stopnetwork() {
         if [[ -z $(printf "%s" $pdhandle) ]]; then
                 return 0
         fi
-        if ! ret=$(timeout $tout qmicli -d $devname --wds-stop-network=$pdhandle --client-no-release-cid --client-cid=$wds); then
+        if ! ret=$(timeout $tout qmicli -p -d $devname --wds-stop-network=$pdhandle --client-no-release-cid --client-cid=$wds); then
                 printf "[qmictrl][WARN ] failed to stop WDS session:\n%s\n" "$ret"
                 pdhandle=""
                 return 1
@@ -278,6 +310,7 @@ router="n"
 tout="10"
 retryinterval="1"
 apn="internet"
+gpio="" # Reset gpio for _reset, empty disables it
 pdhandle=""
 while [[ $# -gt 0 ]]; do
         case $1 in
@@ -326,12 +359,18 @@ while true; do
         state=$next_state
         case $state in
                 STATUS)
+                        # Modem not answering after maxtries, power cycle it
+                        if [ "$tries" -gt "$maxtries" ]; then
+                                _reset
+                                tries=1
+                        fi
                         printf "[qmictrl] device path:   \t%s\n" "$devname"
                         printf "[qmictrl] interface name:\t%s\n" "$iface"
                         printf "[qmictrl] probe address: \t%s\n" "$probe"
                         printf "[qmictrl] probe interval:\t%s\n" "$interval"
                         printf "[qmictrl] be router:     \t%s\n" "$router"
                         printf "[qmictrl] lan:           \t%s\n" "$lan"
+                        printf "[qmictrl] reset gpio:    \t%s\n" "$gpio"
 
                         _stopnetwork
                         if [[ -n $(printf "%s" $wds) ]]; then 
@@ -363,6 +402,7 @@ while true; do
                         fi
                 ;;
                 AVAILABLE)
+                        _getsignal
                         ret=$(_getnetwork)
                         if [[ -z $(printf "%s" $ret) ]]; then
                                 if [ "$tries" -lt "$maxtries" ]; then
@@ -383,7 +423,8 @@ while true; do
                                         _stopnetwork
                                         sleep $retryinterval
                                 else
-                                        next_state=AVAILABLE
+                                        # Restart from STATUS, AVAILABLE succeeds while registered and loops back here
+                                        next_state=STATUS
                                 fi
                         else
                                 if [[ "$router" == "n" ]]; then
@@ -402,19 +443,27 @@ while true; do
                 ;;
                 PROBE)
                         ret=$(ping -I $iface -3 -i 1 -w $interval $probe 2>&1)
+                        # Search the "packet loss" field, ping adds "+N errors" before it on failures
                         loss=$(awk -F',' '/packet loss/ {
-                                gsub(/[^0-9.]/, "", $3)
-                                print $3
+                                for (i = 1; i <= NF; i++)
+                                        if ($i ~ /packet loss/) {
+                                                gsub(/[^0-9.]/, "", $i)
+                                                print int($i)
+                                        }
                         }' <<< "$ret")
                         rtt=$(awk -F'/' '/^(rtt|round-trip)/ {
                                 print $5
                         }' <<< "$ret")
                         if [[ -z $(printf "%s" $loss) ]]; then
                                 loss=100
-                                rtt=-1
+                        fi
+                        # No reply means no rtt line from ping
+                        if [[ -z $(printf "%s" $rtt) ]]; then
+                                rtt="--"
                         fi
                         printf "[qmictrl][DEBUG] packet loss: %s%%, RTT: %s ms\n" "$loss" "$rtt"
-                        ret=$(timeout $tout qmicli -d $devname --wds-get-packet-statistics --client-no-release-cid --client-cid=$wds)
+                        _getsignal
+                        ret=$(timeout $tout qmicli -p -d $devname --wds-get-packet-statistics --client-no-release-cid --client-cid=$wds)
                         if grep -qi "packets" <<< "$ret"; then
                                 tx_packets=$(awk -F: '/TX packets OK:/ {gsub(/[^0-9]/,"",$2); print $2}' <<< "$ret")
                                 rx_packets=$(awk -F: '/RX packets OK:/ {gsub(/[^0-9]/,"",$2); print $2}' <<< "$ret")
@@ -430,12 +479,12 @@ while true; do
                                 printf "%s\n" "$rx_bytes"   > "$telpath/rx_bytes"
                         fi
                         if [ $loss -gt 80 ] && [ $loss -le 95 ]; then
-                                printf "[qmictrl][INFO] Connection instable %s packet loss, %s ms ...\n" $loss $rtt
+                                printf "[qmictrl][INFO] Connection instable %s%% packet loss, %s ms ...\n" $loss $rtt
                                 tries=0
                                 next_state=PROBE
                         elif [ $loss -gt 95 ]; then
                                 if [ "$tries" -lt "$maxtries" ]; then
-                                        printf "[qmictrl][INFO] Connection instable %s packet loss, %s ms ...\n" $loss $rtt
+                                        printf "[qmictrl][INFO] Connection instable %s%% packet loss, %s ms ...\n" $loss $rtt
                                         next_state=PROBE
                                         sleep $retryinterval
                                 else
