@@ -277,7 +277,7 @@ function _cleanup() {
         exit $status
 }
 function _getsignal() {
-        local ret item
+        local ret item bars
         ret=$(timeout $tout qmicli -p -d $devname --nas-get-signal-info --client-no-release-cid --client-cid=$nas)
         if grep -qi "RSSI" <<< "$ret"; then
                 item=$(awk -F"'" '/RSSI:/ {split($2, v, " "); print v[1]; exit}' <<< "$ret")
@@ -296,12 +296,17 @@ function _getsignal() {
                 printf "%s\n" "$item"   > "$telpath/snr"
                 item="-30"
         fi
-
-        [[ "$snr" -lt "-5" ]] &&                   printf "[qmicli][DEBUG ] (...) "
-        [[ "$snr" -lt "3" && "$snr" -gt "-5" ]] && printf "[qmicli][DEBUG ] (..|) "
-        [[ "$snr" -lt "15" && "$snr" -gt "3" ]] && printf "[qmicli][DEBUG ] (.||) "
-        [[ "$snr" -gt "15" ]] &&                   printf "[qmicli][DEBUG ] (|||) "
-        printf "(snr: %s dB)\n" "$snr"
+        item="${item%.*}"
+        if [[ "$item" -le "-5" ]]; then
+                bars="(   )"
+        elif [[ "$item" -le "3" ]]; then
+                bars="(.  )"
+        elif [[ "$item" -le "15" ]]; then
+                bars="(.: )"
+        else
+                bars="(.:|)"
+        fi
+        printf "[qmicli][DEBUG ] %s (snr: %s dB)\n" "$bars" "$item"
 }
 function _getstats() {
         local ret item
