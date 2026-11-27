@@ -296,6 +296,7 @@ function _getsignal() {
                 printf "%s\n" "$item"   > "$telpath/snr"
                 item="-30"
         fi
+        # https://www.telcoantennas.com.au/blog/guide-to-mobile-networks/4g-lte-signal-strength-reference-guide/
         item="${item%.*}"
         if [[ "$item" -le "-5" ]]; then
                 bars="(   )"
