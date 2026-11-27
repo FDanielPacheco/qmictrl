@@ -306,7 +306,7 @@ function _getsignal() {
         else
                 bars="(.:|)"
         fi
-        printf "[qmicli][DEBUG ] %s (snr: %s dB)\n" "$bars" "$item"
+        printf "[qmictrl][DEBUG] %s (snr: %s dB)\n" "$bars" "$item"
 }
 function _getstats() {
         local ret item
